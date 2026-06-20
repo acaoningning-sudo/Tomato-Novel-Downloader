@@ -181,28 +181,40 @@ fn prepare_download_plan_web(
     };
     let web = FanqieWebNetwork::new(web_cfg).context("init FanqieWebNetwork")?;
 
-    let chapter_values = web
-        .fetch_chapter_list(book_id)
-        .ok_or_else(|| anyhow!("获取章节列表失败"))?;
+    let chapter_values = web.fetch_chapter_list(book_id);
 
     let mut chapters: Vec<ChapterRef> = Vec::new();
-    let is_short_story = chapter_values.is_empty();
+    let is_short_story: bool;
 
-    if is_short_story {
-        // 短篇小说处理：短篇没有传统多章节结构，
-        // 整个故事使用 book_id 作为 item_id 获取
-        info!(target: "download", book_id, "章节列表为空，尝试以短篇小说方式处理");
-        chapters.push(ChapterRef {
-            id: book_id.to_string(),
-            title: String::new(), // 稍后使用书名填充
-        });
-    } else {
-        chapters = chapter_values
-            .iter()
-            .filter_map(parse_chapter_ref_from_value)
-            .collect();
-        if chapters.is_empty() {
-            return Err(anyhow!("解析章节列表失败（未能提取 item_id/title）"));
+    match chapter_values {
+        Some(values) if !values.is_empty() => {
+            // 正常长篇小说：有章节列表
+            is_short_story = false;
+            chapters = values
+                .iter()
+                .filter_map(parse_chapter_ref_from_value)
+                .collect();
+            if chapters.is_empty() {
+                return Err(anyhow!("解析章节列表失败（未能提取 item_id/title）"));
+            }
+        }
+        Some(_) => {
+            // 章节列表为空（短篇小说没有多章节结构）
+            info!(target: "download", book_id, "章节列表为空，尝试以短篇小说方式处理");
+            is_short_story = true;
+            chapters.push(ChapterRef {
+                id: book_id.to_string(),
+                title: String::new(), // 稍后使用书名填充
+            });
+        }
+        None => {
+            // 目录 API 返回错误（短篇小说可能没有目录接口）
+            info!(target: "download", book_id, "目录 API 失败，尝试以短篇小说方式处理");
+            is_short_story = true;
+            chapters.push(ChapterRef {
+                id: book_id.to_string(),
+                title: String::new(),
+            });
         }
     }
 
