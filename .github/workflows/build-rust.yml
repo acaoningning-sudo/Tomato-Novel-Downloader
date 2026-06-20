@@ -5,31 +5,24 @@ on:
     branches: ["main", "dev"]
   workflow_dispatch:
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
-  build-linux:
-    name: Build (linux-amd64)
-    runs-on: ubuntu-latest
+  build-windows:
+    name: Build (windows-amd64)
+    runs-on: windows-latest
     steps:
-      - name: Checkout A Repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Clean and Update
-        run: |
-          rm -f Cargo.lock
-          cargo update
-
       - name: Build release binary
-        # 移除官方 API 依赖后的编译命令
-        run: cargo build --release --no-default-features --features "tts-native"
+        shell: pwsh
+        run: |
+          cargo build --release --no-default-features --features "tts-native"
 
       - name: Bundle artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: tomato-downloader-linux
-          path: target/release/tomato-novel-downloader
+          name: tomato-downloader-windows
+          path: target/release/tomato-novel-downloader.exe
