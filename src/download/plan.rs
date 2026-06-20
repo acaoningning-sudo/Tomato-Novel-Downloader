@@ -1,6 +1,6 @@
 //! 下载计划准备与元数据搜索。
 //!
-//! 负责从官方 API 或 Web 端拉取目录、章节列表，合并元数据，生成 `DownloadPlan`。
+//! 负责从官方 API 或 Web 端拉取目录、章节列表，合并元数据，生成 DownloadPlan。
 
 #[cfg(feature = "official-api")]
 use std::collections::{HashMap, HashSet};
@@ -184,17 +184,26 @@ fn prepare_download_plan_web(
     let chapter_values = web
         .fetch_chapter_list(book_id)
         .ok_or_else(|| anyhow!("获取章节列表失败"))?;
-    if chapter_values.is_empty() {
-        return Err(anyhow!("目录为空"));
-    }
 
-    let mut chapters: Vec<ChapterRef> = chapter_values
-        .iter()
-        .filter_map(parse_chapter_ref_from_value)
-        .collect();
-    // 保底：如果解析失败导致为空，至少让用户得到一个明确错误
-    if chapters.is_empty() {
-        return Err(anyhow!("解析章节列表失败（未能提取 item_id/title）"));
+    let mut chapters: Vec<ChapterRef> = Vec::new();
+    let is_short_story = chapter_values.is_empty();
+
+    if is_short_story {
+        // 短篇小说处理：短篇没有传统多章节结构，
+        // 整个故事使用 book_id 作为 item_id 获取
+        info!(target: "download", book_id, "章节列表为空，尝试以短篇小说方式处理");
+        chapters.push(ChapterRef {
+            id: book_id.to_string(),
+            title: String::new(), // 稍后使用书名填充
+        });
+    } else {
+        chapters = chapter_values
+            .iter()
+            .filter_map(parse_chapter_ref_from_value)
+            .collect();
+        if chapters.is_empty() {
+            return Err(anyhow!("解析章节列表失败（未能提取 item_id/title）"));
+        }
     }
 
     let (
@@ -208,6 +217,14 @@ fn prepare_download_plan_web(
         chapter_count,
         finished,
     ) = web.get_book_info(book_id);
+
+    // 短篇小说：用书名作为章节标题
+    if is_short_story && chapters.len() == 1 && chapters[0].title.is_empty() {
+        if let Some(ref name) = book_name {
+            chapters[0].title = name.clone();
+        }
+    }
+
     let web_meta = BookMeta {
         book_name,
         author,
@@ -233,11 +250,22 @@ fn prepare_download_plan_web(
         download_web_cover(config, book_id, &completed_meta, &cover_dir);
     }
 
-    let raw = serde_json::json!({
-        "book_id": book_id,
-        "chapters": chapter_values,
-        "source": "fanqie_web",
-    });
+    let raw = if is_short_story {
+        serde_json::json!({
+            "book_id": book_id,
+            "chapters": [{
+                "item_id": book_id,
+                "title": chapters[0].title,
+            }],
+            "source": "fanqie_web_short_story",
+        })
+    } else {
+        serde_json::json!({
+            "book_id": book_id,
+            "chapters": chapter_values,
+            "source": "fanqie_web",
+        })
+    };
 
     // 章节顺序：web 接口一般已经是正确顺序；保险起见保持原顺序即可
     Ok(DownloadPlan {
@@ -408,7 +436,7 @@ fn download_web_cover(
 ) {
     let book_name = meta.book_name.as_deref();
 
-    // 检查并迁移旧版“书名.*”封面；新版统一保存为 cover.*。
+    // 检查并迁移旧版"书名.*"封面；新版统一保存为 cover.*。
     if let Some(existing) = book_paths::migrate_legacy_cover_file(cover_dir, book_name) {
         info!(target: "download", book_id, path = %existing.display(), "封面文件已存在，跳过下载");
         return;
@@ -489,3 +517,4 @@ fn download_web_cover(
 
     warn!(target: "download", book_id, "web 封面下载失败（已重试 {} 次）", max_retries);
 }
+
