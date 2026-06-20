@@ -19,9 +19,13 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Clean and Update
+        run: |
+          rm -f Cargo.lock
+          cargo update
+
       - name: Build release binary
-        # 使用 --no-default-features 绕过缺失的 tomato-novel-official-api 依赖
-        # 并显式开启 tts-native 功能
+        # 移除官方 API 依赖后的编译命令
         run: cargo build --release --no-default-features --features "tts-native"
 
       - name: Bundle artifacts
