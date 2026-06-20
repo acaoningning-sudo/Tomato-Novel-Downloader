@@ -18,8 +18,9 @@ jobs:
 
       - name: Build release binary
         shell: pwsh
+        # 同时开启 tts-native 和 windows-icon 特性
         run: |
-          cargo build --release --no-default-features --features "tts-native"
+          cargo build --release --features "tts-native windows-icon"
 
       - name: Bundle artifacts
         uses: actions/upload-artifact@v4
