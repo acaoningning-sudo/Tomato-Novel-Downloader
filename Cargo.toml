@@ -2,6 +2,7 @@
 name = "tomato-novel-downloader"
 version = "1.0.3"
 edition = "2021"
+build = "build.rs"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -28,10 +29,13 @@ winrt = { version = "0.7", optional = true }
 winapi = { version = "0.3", features = ["winuser"], optional = true }
 registry = { version = "1.1", optional = true }
 image = { version = "0.24", optional = true }
+winres = { version = "0.1", optional = true }
 
 [features]
 default = ["tts-native"]
 tts-native = ["dep:tts", "dep:winrt", "dep:winapi", "dep:registry"]
+# 如果编译还报错，说明 build.rs 里硬编码了 winres，所以我们这里必须加上它
+windows-icon = ["dep:winres"]
 
 [profile.release]
 opt-level = "z"
