@@ -187,7 +187,8 @@ fn prepare_download_plan_web(
     let is_short_story: bool;
 
     match chapter_values {
-        Some(values) if !values.is_empty() => {
+        // 核心修正：加了 ref，防止变量被吃掉
+        Some(ref values) if !values.is_empty() => {
             // 正常长篇小说：有章节列表
             is_short_story = false;
             chapters = values
@@ -529,4 +530,3 @@ fn download_web_cover(
 
     warn!(target: "download", book_id, "web 封面下载失败（已重试 {} 次）", max_retries);
 }
-
