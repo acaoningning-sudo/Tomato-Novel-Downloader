@@ -29,13 +29,14 @@ winrt = { version = "0.7", optional = true }
 winapi = { version = "0.3", features = ["winuser"], optional = true }
 registry = { version = "1.1", optional = true }
 image = { version = "0.24", optional = true }
-winres = { version = "0.1", optional = true }
+
+# 核心修正：把 winres 挪到 build-dependencies，专门供给 build.rs 编译图标使用
+[build-dependencies]
+winres = "0.1"
 
 [features]
 default = ["tts-native"]
 tts-native = ["dep:tts", "dep:winrt", "dep:winapi", "dep:registry"]
-# 如果编译还报错，说明 build.rs 里硬编码了 winres，所以我们这里必须加上它
-windows-icon = ["dep:winres"]
 
 [profile.release]
 opt-level = "z"
