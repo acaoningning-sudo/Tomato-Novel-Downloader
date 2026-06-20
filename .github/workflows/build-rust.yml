@@ -3,7 +3,6 @@ name: Build Rust Downloader
 on:
   push:
     branches: ["main", "dev"]
-    tags: ["v*"]
   workflow_dispatch:
 
 env:
@@ -17,39 +16,13 @@ jobs:
       - name: Checkout A Repository
         uses: actions/checkout@v4
 
-      - name: Compute Cargo.lock hash
-        id: cargo-lock-hash
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ ! -f Cargo.lock ]; then
-            echo "hash=missing" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if command -v python3 >/dev/null 2>&1; then
-            PYTHON=python3
-          else
-            PYTHON=python
-          fi
-          HASH=$($PYTHON -c "import hashlib, pathlib; print(hashlib.sha256(pathlib.Path('Cargo.lock').read_bytes()).hexdigest())")
-          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo artifacts
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ steps.cargo-lock-hash.outputs.hash }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
       - name: Build release binary
-        run: cargo build --release
+        # 使用 --no-default-features 绕过缺失的 tomato-novel-official-api 依赖
+        # 并显式开启 tts-native 功能
+        run: cargo build --release --no-default-features --features "tts-native"
 
       - name: Bundle artifacts
         uses: actions/upload-artifact@v4
