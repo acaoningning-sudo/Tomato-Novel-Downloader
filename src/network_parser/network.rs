@@ -40,8 +40,6 @@ fn re_info_label_yellow() -> &'static regex::Regex {
     })
 }
 
-/// 匹配 HTML `<head>` 中 `<script type="application/ld+json">...</script>` 块。
-/// 封面图的真实 URL（带签名参数）位于其中的 `"image"` 或 `"images"` 字段。
 fn re_ld_json() -> &'static regex::Regex {
     static R: OnceLock<regex::Regex> = OnceLock::new();
     R.get_or_init(|| {
@@ -60,10 +58,11 @@ pub(crate) struct BookInfo {
     pub tags: Option<Vec<String>>,
     pub cover_url: Option<String>,
     pub detail_cover_url: Option<String>,
-    /// HTML `<img class="book-cover-img">` 的 src，浏览器兼容格式（非 HEIC）。
     pub html_img_cover_url: Option<String>,
     pub chapter_count: Option<usize>,
     pub finished: Option<bool>,
+    // 🌟新增核心：抓取真实的短篇正文 ID
+    pub first_item_id: Option<String>, 
 }
 
 #[derive(Debug, Clone)]
@@ -100,9 +99,10 @@ pub(crate) type BookInfoParts = (
     Option<Vec<String>>,
     Option<String>,
     Option<String>,
-    Option<String>, // html_img_cover_url
+    Option<String>, 
     Option<usize>,
     Option<bool>,
+    Option<String>, // 🌟新增的返回值位置
 );
 
 impl FanqieWebNetwork {
@@ -162,7 +162,6 @@ impl FanqieWebNetwork {
     pub(crate) fn get_book_info(&self, book_id: &str) -> BookInfoParts {
         let book_info_url = format!("https://fanqienovel.com/page/{book_id}");
 
-        // 发送请求
         match self
             .client
             .get(&book_info_url)
@@ -170,9 +169,8 @@ impl FanqieWebNetwork {
             .send()
         {
             Ok(resp) => {
-                // 核心修改点：主页 404 时，回退获取短篇小说阅读页
                 if resp.status().as_u16() == 404 {
-                    warn!("小说ID {} 主页 404，猜测其可能是短篇小说(itemId)。尝试回退至阅读页获取信息...", book_id);
+                    warn!("小说ID {} 主页 404，尝试回退至阅读页获取信息...", book_id);
                     let reader_url = format!("https://fanqienovel.com/reader/{}", book_id);
                     if let Ok(reader_resp) = self.client.get(&reader_url).headers(self.get_headers()).send() {
                         if reader_resp.status().is_success() {
@@ -188,19 +186,20 @@ impl FanqieWebNetwork {
                                     info.html_img_cover_url,
                                     info.chapter_count,
                                     info.finished,
+                                    info.first_item_id,
                                 );
                             }
                         }
                     }
-                    error!("小说ID {} 不存在！(主页和阅读页均无数据返回)", book_id);
-                    return (None, None, None, None, None, None, None, None, None);
+                    error!("小说ID {} 不存在！", book_id);
+                    return (None, None, None, None, None, None, None, None, None, None);
                 }
 
                 let resp = match resp.error_for_status() {
                     Ok(r) => r,
                     Err(e) => {
                         error!("获取书籍信息失败: {}", e);
-                        return (None, None, None, None, None, None, None, None, None);
+                        return (None, None, None, None, None, None, None, None, None, None);
                     }
                 };
 
@@ -217,33 +216,28 @@ impl FanqieWebNetwork {
                             info.html_img_cover_url,
                             info.chapter_count,
                             info.finished,
+                            info.first_item_id,
                         )
                     }
                     Err(e) => {
                         error!("获取书籍信息失败: {}", e);
-                        (None, None, None, None, None, None, None, None, None)
+                        (None, None, None, None, None, None, None, None, None, None)
                     }
                 }
             }
             Err(e) => {
                 error!("获取书籍信息失败: {}", e);
-                (None, None, None, None, None, None, None, None, None)
+                (None, None, None, None, None, None, None, None, None, None)
             }
         }
     }
 
-    /// 从 web API 获取章节列表（节流 + 403 预热 + 退避重试 + 本地缓存回退）。
     pub(crate) fn fetch_chapter_list(&self, book_id: &str) -> Option<Vec<Value>> {
-        // 无效 book_id 直接返回 None，避免无意义请求
         if book_id.trim().is_empty() || !book_id.chars().all(|c| c.is_ascii_digit()) {
-            warn!("fetch_chapter_list 跳过无效 book_id: '{}'", book_id);
             return None;
         }
 
-        let api_url =
-            format!("https://fanqienovel.com/api/reader/directory/detail?bookId={book_id}");
-
-        // 节流：与上次请求间隔至少 0.8s，降低被限频概率
+        let api_url = format!("https://fanqienovel.com/api/reader/directory/detail?bookId={book_id}");
         self.throttle_directory(Duration::from_millis(800));
 
         let retries = self.config.max_retries.max(1);
@@ -251,67 +245,24 @@ impl FanqieWebNetwork {
         let mut last_error: Option<String> = None;
 
         for attempt in 1..=retries {
-            debug!("开始获取章节列表，URL: {}", api_url);
             let headers = self.get_json_headers(book_id);
-
-            if attempt == 1 {
-                // 屏蔽 Cookie（如果未来启用 cookies feature，这里也不会泄露）
-                let masked: Vec<(String, String)> = headers
-                    .iter()
-                    .map(|(k, v)| {
-                        let key = k.as_str().to_string();
-                        let val = if key.eq_ignore_ascii_case("cookie") {
-                            "***".to_string()
-                        } else {
-                            v.to_str().unwrap_or("").to_string()
-                        };
-                        (key, val)
-                    })
-                    .collect();
-                debug!("目录请求Header(精简): {:?}", masked);
-            } else {
-                debug!(
-                    "重试第 {} 次获取目录（可能被限频/风控），URL: {}",
-                    attempt, api_url
-                );
-            }
-
             let resp = self.client.get(&api_url).headers(headers).send();
 
             let resp = match resp {
                 Ok(r) => r,
                 Err(e) => {
                     last_error = Some(e.to_string());
-                    error!("获取章节列表失败: {}", e);
                     self.sleep_backoff(attempt, retries, &mut backoff, 0.3);
                     continue;
                 }
             };
 
-            debug!("章节列表响应状态: {}", resp.status().as_u16());
-
-            // 显式处理 403：可能为风控或限频
             if resp.status().as_u16() == 403 {
                 last_error = Some("403 Forbidden".to_string());
-
-                // 首次遇到 403 时，尝试预热页面以获取必要 Cookie，再退避重试
                 if attempt == 1 {
                     let warm_url = format!("https://fanqienovel.com/page/{book_id}");
-                    match self
-                        .client
-                        .get(&warm_url)
-                        .headers(self.get_headers())
-                        .send()
-                    {
-                        Ok(_) => {
-                            debug!("已尝试通过页面预热获取 Cookie，准备退避后重试目录 API");
-                        }
-                        Err(e) => {
-                            debug!("页面预热失败: {}", e);
-                        }
-                    }
+                    let _ = self.client.get(&warm_url).headers(self.get_headers()).send();
                 }
-
                 self.sleep_backoff(attempt, retries, &mut backoff, 0.4);
                 continue;
             }
@@ -320,7 +271,6 @@ impl FanqieWebNetwork {
                 Ok(r) => r,
                 Err(e) => {
                     last_error = Some(e.to_string());
-                    error!("获取章节列表失败: {}", e);
                     self.sleep_backoff(attempt, retries, &mut backoff, 0.3);
                     continue;
                 }
@@ -330,35 +280,24 @@ impl FanqieWebNetwork {
                 Ok(v) => v,
                 Err(e) => {
                     last_error = Some(e.to_string());
-                    error!("获取章节列表失败: {}", e);
                     self.sleep_backoff(attempt, retries, &mut backoff, 0.3);
                     continue;
                 }
             };
 
-            // 成功则缓存原始 JSON，便于下次回退
-            if let Err(e) = self.save_dir_cache(book_id, &data) {
-                debug!("保存目录缓存失败(忽略): {}", e);
-            }
+            let _ = self.save_dir_cache(book_id, &data);
 
             if let Some(list) = Self::parse_chapter_data(&data) {
                 return Some(list);
             }
 
             last_error = Some("parse chapter list failed".to_string());
-            warn!("获取章节列表失败: 解析章节数组为空");
             self.sleep_backoff(attempt, retries, &mut backoff, 0.3);
             continue;
         }
 
-        debug!("重试仍失败：{:?}", last_error);
-
-        // 重试仍失败：尝试使用本地缓存回退
         match self.load_dir_cache(book_id) {
-            Ok(Some(cached)) => {
-                debug!("使用本地缓存的章节目录回退: book_id={}", book_id);
-                Self::parse_chapter_data(&cached)
-            }
+            Ok(Some(cached)) => Self::parse_chapter_data(&cached),
             _ => None,
         }
     }
@@ -408,22 +347,12 @@ impl FanqieWebNetwork {
     }
 
     fn parse_chapter_data(data: &Value) -> Option<Vec<Value>> {
-        // 兼容多种返回形态：尽量提取出“章节数组”。
         let root = data.get("data").unwrap_or(data);
-
-        for key in [
-            "chapterList",
-            "chapter_list",
-            "chapters",
-            "item_list",
-            "items",
-            "list",
-        ] {
+        for key in ["chapterList", "chapter_list", "chapters", "item_list", "items", "list"] {
             if let Some(arr) = root.get(key).and_then(Value::as_array) {
                 return Some(arr.clone());
             }
         }
-        // chapterListWithVolume：按卷分组的章节列表（数组的数组），需要展平
         if let Some(volumes) = root.get("chapterListWithVolume").and_then(Value::as_array) {
             let mut all_chapters: Vec<Value> = Vec::new();
             for vol in volumes {
@@ -431,41 +360,21 @@ impl FanqieWebNetwork {
                     all_chapters.extend(ch_list.iter().cloned());
                 }
             }
-            if !all_chapters.is_empty() {
-                return Some(all_chapters);
-            }
+            if !all_chapters.is_empty() { return Some(all_chapters); }
         }
-        // 有些接口会是 data.data.list / data.data.chapterList / data.data.items
         if let Some(inner) = root.get("data") {
-            for key in [
-                "list",
-                "chapterList",
-                "chapter_list",
-                "items",
-                "item_list",
-                "chapters",
-            ] {
+            for key in ["list", "chapterList", "chapter_list", "items", "item_list", "chapters"] {
                 if let Some(arr) = inner.get(key).and_then(Value::as_array) {
                     return Some(arr.clone());
                 }
             }
         }
-
-        // 最后兜底：递归扫描 JSON，找到“像章节数组”的最大数组
         find_chapter_array(root)
     }
 }
 
 fn is_chapter_like_object(map: &serde_json::Map<String, Value>) -> bool {
-    let keys = [
-        "item_id",
-        "itemId",
-        "chapter_id",
-        "chapterId",
-        "catalog_id",
-        "catalogId",
-        "id",
-    ];
+    let keys = ["item_id", "itemId", "chapter_id", "chapterId", "catalog_id", "catalogId", "id"];
     keys.iter().any(|k| map.contains_key(*k))
 }
 
@@ -473,63 +382,36 @@ fn find_chapter_array(value: &Value) -> Option<Vec<Value>> {
     fn walk(value: &Value, best: &mut Option<Vec<Value>>) {
         match value {
             Value::Array(arr) => {
-                let is_candidate = arr
-                    .iter()
-                    .any(|v| v.as_object().map(is_chapter_like_object).unwrap_or(false));
+                let is_candidate = arr.iter().any(|v| v.as_object().map(is_chapter_like_object).unwrap_or(false));
                 if is_candidate {
-                    let replace = match best {
-                        Some(existing) => arr.len() > existing.len(),
-                        None => true,
-                    };
-                    if replace {
-                        *best = Some(arr.clone());
-                    }
+                    let replace = match best { Some(existing) => arr.len() > existing.len(), None => true };
+                    if replace { *best = Some(arr.clone()); }
                 }
-                for v in arr {
-                    walk(v, best);
-                }
+                for v in arr { walk(v, best); }
             }
-            Value::Object(map) => {
-                for v in map.values() {
-                    walk(v, best);
-                }
-            }
+            Value::Object(map) => { for v in map.values() { walk(v, best); } }
             _ => {}
         }
     }
-
     let mut best: Option<Vec<Value>> = None;
     walk(value, &mut best);
     best
 }
 
-/// 从 HTML `<head>` 中的 `<script type="application/ld+json">` 结构化数据提取封面 URL。
-///
-/// 番茄小说页面的 `<img class="book-cover-img">` 实际是占位符，
-/// 真正的封面 URL（带 CDN 签名参数）位于 ld+json 的 `"image"` / `"images"` 字段。
 fn parse_html_img_cover_url(html: &str) -> Option<String> {
     for caps in re_ld_json().captures_iter(html) {
         let json_text = caps.get(1)?.as_str();
-        let Ok(value) = serde_json::from_str::<Value>(json_text) else {
-            continue;
-        };
-        // schema.org NewsArticle: "image": ["https://..."]
-        // baidu cambrian: "images": ["https://..."]
+        let Ok(value) = serde_json::from_str::<Value>(json_text) else { continue; };
         for key in ["image", "images"] {
             if let Some(arr) = value.get(key).and_then(Value::as_array)
                 && let Some(url) = arr.first().and_then(Value::as_str)
             {
                 let u = url.trim();
-                if !u.is_empty() && (u.starts_with("http://") || u.starts_with("https://")) {
-                    return Some(u.to_string());
-                }
+                if !u.is_empty() && (u.starts_with("http://") || u.starts_with("https://")) { return Some(u.to_string()); }
             }
-            // 也兼容非数组形式 "image": "https://..."
             if let Some(url) = value.get(key).and_then(Value::as_str) {
                 let u = url.trim();
-                if !u.is_empty() && (u.starts_with("http://") || u.starts_with("https://")) {
-                    return Some(u.to_string());
-                }
+                if !u.is_empty() && (u.starts_with("http://") || u.starts_with("https://")) { return Some(u.to_string()); }
             }
         }
     }
@@ -539,283 +421,130 @@ fn parse_html_img_cover_url(html: &str) -> Option<String> {
 struct ContentParser;
 
 impl ContentParser {
-    /// 从 HTML 中尽量解析出书籍信息。
-    ///
-    /// 说明：番茄页面结构可能变化，这里采用"优先解析 __NEXT_DATA__ JSON，其次正则兜底"的策略。
     fn parse_book_info(html: &str, _book_id: &str) -> BookInfo {
         let finished_from_label = parse_finished_from_info_label(html);
         let html_img_cover_url = parse_html_img_cover_url(html);
 
-        // 1) 优先解析 __NEXT_DATA__
         if let Some(json_text) = extract_next_data_json(html)
             && let Ok(value) = serde_json::from_str::<Value>(&json_text)
         {
             let book_name = find_string_by_key(&value, ["bookName", "book_name", "title", "name"]);
             let author = find_string_by_key(&value, ["author", "authorName", "author_name"]);
-            let description =
-                find_string_by_key(&value, ["abstract", "description", "intro", "introduce"]);
-            let cover_url = find_string_by_key(
-                &value,
-                [
-                    "thumb_url",
-                    "expand_thumb_url",
-                    "cover_url",
-                    "cover",
-                    "horiz_thumb_url",
-                    "audio_thumb_url_hd",
-                ],
-            )
-            .or_else(|| {
-                find_string_by_key(&value, ["thumb_uri"])
-                    .and_then(|s| build_cover_url_from_thumb_uri(&s))
-            });
-            let detail_cover_url = find_string_by_key(
-                &value,
-                [
-                    "detail_page_thumb_url",
-                    "detail_cover_url",
-                    "detail_thumb_url",
-                ],
-            )
-            .or_else(|| cover_url.clone());
+            let description = find_string_by_key(&value, ["abstract", "description", "intro", "introduce"]);
+            let cover_url = find_string_by_key(&value, ["thumb_url", "expand_thumb_url", "cover_url", "cover", "horiz_thumb_url", "audio_thumb_url_hd"])
+                .or_else(|| find_string_by_key(&value, ["thumb_uri"]).and_then(|s| build_cover_url_from_thumb_uri(&s)));
+            let detail_cover_url = find_string_by_key(&value, ["detail_page_thumb_url", "detail_cover_url", "detail_thumb_url"]).or_else(|| cover_url.clone());
             let chapter_count = find_usize_by_key(&value, ["chapterCount", "chapter_count"]);
             let tags = find_string_array_by_key(&value, ["tags", "tagNames", "tag_names"]);
             let finished = finished_from_label.or_else(|| find_finished_by_key(&value));
+            
+            // 🌟 雷达启动：挖掘首章（短篇本体）ID
+            let first_item_id = find_string_by_key(&value, ["first_chapter_item_id", "firstChapterItemId", "item_id", "itemId"]);
 
-            if book_name.is_some()
-                || author.is_some()
-                || description.is_some()
-                || cover_url.is_some()
-                || detail_cover_url.is_some()
-                || chapter_count.is_some()
-                || tags.is_some()
-            {
+            if book_name.is_some() || first_item_id.is_some() {
                 return BookInfo {
-                    book_name,
-                    author,
-                    description,
-                    tags,
-                    cover_url,
-                    detail_cover_url,
-                    html_img_cover_url,
-                    chapter_count,
-                    finished,
+                    book_name, author, description, tags, cover_url, detail_cover_url, html_img_cover_url, chapter_count, finished, first_item_id,
                 };
             }
         }
 
-        // 1.5) 解析 __INITIAL_STATE__
         if let Some(json_text) = extract_initial_state_json(html)
             && let Ok(value) = serde_json::from_str::<Value>(&json_text)
         {
             let book_name = find_string_by_key(&value, ["bookName", "book_name", "title", "name"]);
             let author = find_string_by_key(&value, ["authorName", "author", "author_name"]);
-            let description =
-                find_string_by_key(&value, ["abstract", "description", "intro", "introduce"]);
-            let cover_url = find_string_by_key(
-                &value,
-                [
-                    "thumb_url",
-                    "expand_thumb_url",
-                    "cover_url",
-                    "cover",
-                    "horiz_thumb_url",
-                    "audio_thumb_url_hd",
-                ],
-            )
-            .or_else(|| {
-                find_string_by_key(&value, ["thumb_uri"])
-                    .and_then(|s| build_cover_url_from_thumb_uri(&s))
-            });
-            let detail_cover_url = find_string_by_key(
-                &value,
-                [
-                    "detail_page_thumb_url",
-                    "detail_cover_url",
-                    "detail_thumb_url",
-                ],
-            )
-            .or_else(|| cover_url.clone());
-            let chapter_count =
-                find_usize_by_key(&value, ["chapterTotal", "chapterCount", "chapter_count"]);
-            let tags = find_string_array_by_key(&value, ["tags", "tagNames", "tag_names"])
-                .or_else(|| parse_tags_from_info_label(html));
+            let description = find_string_by_key(&value, ["abstract", "description", "intro", "introduce"]);
+            let cover_url = find_string_by_key(&value, ["thumb_url", "expand_thumb_url", "cover_url", "cover", "horiz_thumb_url", "audio_thumb_url_hd"])
+                .or_else(|| find_string_by_key(&value, ["thumb_uri"]).and_then(|s| build_cover_url_from_thumb_uri(&s)));
+            let detail_cover_url = find_string_by_key(&value, ["detail_page_thumb_url", "detail_cover_url", "detail_thumb_url"]).or_else(|| cover_url.clone());
+            let chapter_count = find_usize_by_key(&value, ["chapterTotal", "chapterCount", "chapter_count"]);
+            let tags = find_string_array_by_key(&value, ["tags", "tagNames", "tag_names"]).or_else(|| parse_tags_from_info_label(html));
             let finished = finished_from_label.or_else(|| find_finished_by_key(&value));
+            let first_item_id = find_string_by_key(&value, ["first_chapter_item_id", "firstChapterItemId", "item_id", "itemId"]);
 
-            if book_name.is_some()
-                || author.is_some()
-                || description.is_some()
-                || cover_url.is_some()
-                || detail_cover_url.is_some()
-                || chapter_count.is_some()
-                || tags.is_some()
-                || finished.is_some()
-            {
+            if book_name.is_some() || first_item_id.is_some() {
                 return BookInfo {
-                    book_name,
-                    author,
-                    description,
-                    tags,
-                    cover_url,
-                    detail_cover_url,
-                    html_img_cover_url,
-                    chapter_count,
-                    finished,
+                    book_name, author, description, tags, cover_url, detail_cover_url, html_img_cover_url, chapter_count, finished, first_item_id,
                 };
             }
         }
 
-        // 2) 正则兜底（在 HTML 内直接找 JSON 字段）
-        let book_name = regex_json_string_field(html, "bookName")
-            .or_else(|| regex_json_string_field(html, "book_name"));
-        let author = regex_json_string_field(html, "author")
-            .or_else(|| regex_json_string_field(html, "authorName"));
-        let description = regex_json_string_field(html, "abstract")
-            .or_else(|| regex_json_string_field(html, "description"));
-        let cover_url = regex_json_string_field(html, "thumb_url")
-            .or_else(|| regex_json_string_field(html, "expand_thumb_url"))
-            .or_else(|| regex_json_string_field(html, "cover_url"))
-            .or_else(|| regex_json_string_field(html, "cover"))
-            .or_else(|| regex_json_string_field(html, "horiz_thumb_url"))
-            .or_else(|| regex_json_string_field(html, "audio_thumb_url_hd"))
-            .or_else(|| {
-                regex_json_string_field(html, "thumb_uri")
-                    .and_then(|s| build_cover_url_from_thumb_uri(&s))
-            });
-        let detail_cover_url = regex_json_string_field(html, "detail_page_thumb_url")
-            .or_else(|| regex_json_string_field(html, "detail_cover_url"))
-            .or_else(|| regex_json_string_field(html, "detail_thumb_url"))
-            .or_else(|| cover_url.clone());
-        let chapter_count = regex_json_usize_field(html, "chapterCount")
-            .or_else(|| regex_json_usize_field(html, "chapter_count"));
+        let book_name = regex_json_string_field(html, "bookName").or_else(|| regex_json_string_field(html, "book_name"));
+        let author = regex_json_string_field(html, "author").or_else(|| regex_json_string_field(html, "authorName"));
+        let description = regex_json_string_field(html, "abstract").or_else(|| regex_json_string_field(html, "description"));
+        let cover_url = regex_json_string_field(html, "thumb_url").or_else(|| regex_json_string_field(html, "expand_thumb_url")).or_else(|| regex_json_string_field(html, "cover_url")).or_else(|| regex_json_string_field(html, "cover")).or_else(|| regex_json_string_field(html, "horiz_thumb_url")).or_else(|| regex_json_string_field(html, "audio_thumb_url_hd")).or_else(|| regex_json_string_field(html, "thumb_uri").and_then(|s| build_cover_url_from_thumb_uri(&s)));
+        let detail_cover_url = regex_json_string_field(html, "detail_page_thumb_url").or_else(|| regex_json_string_field(html, "detail_cover_url")).or_else(|| regex_json_string_field(html, "detail_thumb_url")).or_else(|| cover_url.clone());
+        let chapter_count = regex_json_usize_field(html, "chapterCount").or_else(|| regex_json_usize_field(html, "chapter_count"));
         let tags = parse_tags_from_info_label(html);
         let finished = finished_from_label;
+        let first_item_id = regex_json_string_field(html, "first_chapter_item_id").or_else(|| regex_json_string_field(html, "firstChapterItemId")).or_else(|| regex_json_string_field(html, "itemId"));
 
-        BookInfo {
-            book_name,
-            author,
-            description,
-            tags,
-            cover_url,
-            detail_cover_url,
-            html_img_cover_url,
-            chapter_count,
-            finished,
-        }
+        BookInfo { book_name, author, description, tags, cover_url, detail_cover_url, html_img_cover_url, chapter_count, finished, first_item_id }
     }
 }
 
 fn build_cover_url_from_thumb_uri(uri: &str) -> Option<String> {
     let trimmed = uri.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        return Some(trimmed.to_string());
-    }
-    Some(format!(
-        "https://p3-reading-sign.fqnovelpic.com/{}",
-        trimmed
-    ))
+    if trimmed.is_empty() { return None; }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") { return Some(trimmed.to_string()); }
+    Some(format!("https://p3-reading-sign.fqnovelpic.com/{}", trimmed))
 }
 
 fn extract_next_data_json(html: &str) -> Option<String> {
     let caps = re_next_data().captures(html)?;
-    let raw = caps.get(1)?.as_str();
-    Some(raw.trim().to_string())
+    Some(caps.get(1)?.as_str().trim().to_string())
 }
 
 fn extract_initial_state_json(html: &str) -> Option<String> {
     let caps = re_initial_state().captures(html)?;
-    let raw = caps.get(1)?.as_str();
-    Some(raw.trim().to_string())
+    Some(caps.get(1)?.as_str().trim().to_string())
 }
 
 fn find_string_by_key<const N: usize>(value: &Value, keys: [&str; N]) -> Option<String> {
     for key in keys {
-        if let Some(s) = find_first_string_for_key(value, key) {
-            return Some(s);
-        }
+        if let Some(s) = find_first_string_for_key(value, key) { return Some(s); }
     }
     None
 }
 
 fn find_usize_by_key<const N: usize>(value: &Value, keys: [&str; N]) -> Option<usize> {
     for key in keys {
-        if let Some(n) = find_first_usize_for_key(value, key) {
-            return Some(n);
-        }
+        if let Some(n) = find_first_usize_for_key(value, key) { return Some(n); }
     }
     None
 }
 
 fn find_string_array_by_key<const N: usize>(value: &Value, keys: [&str; N]) -> Option<Vec<String>> {
     for key in keys {
-        if let Some(arr) = find_first_string_array_for_key(value, key) {
-            return Some(arr);
-        }
+        if let Some(arr) = find_first_string_array_for_key(value, key) { return Some(arr); }
     }
     None
 }
 
 fn find_finished_by_key(value: &Value) -> Option<bool> {
-    let keys = [
-        "status",
-        "serial_status",
-        "finish_status",
-        "finishStatus",
-        "is_finish",
-        "is_finished",
-    ];
+    let keys = ["status", "serial_status", "finish_status", "finishStatus", "is_finish", "is_finished"];
     for key in keys {
-        if let Some(n) = find_first_i64_for_key(value, key)
-            && let Some(b) = map_status_to_finished(key, n)
-        {
-            return Some(b);
-        }
+        if let Some(n) = find_first_i64_for_key(value, key) && let Some(b) = map_status_to_finished(key, n) { return Some(b); }
     }
     None
 }
 
 fn map_status_to_finished(key: &str, n: i64) -> Option<bool> {
     match key {
-        "status" => match n {
-            1 => Some(true),
-            0 => Some(false),
-            2 => Some(true),
-            _ => None,
-        },
-        "serial_status" => match n {
-            1 => Some(false),
-            2 => Some(true),
-            _ => None,
-        },
-        _ => match n {
-            1 | 2 => Some(true),
-            0 => Some(false),
-            _ => None,
-        },
+        "status" => match n { 1 => Some(true), 0 => Some(false), 2 => Some(true), _ => None, },
+        "serial_status" => match n { 1 => Some(false), 2 => Some(true), _ => None, },
+        _ => match n { 1 | 2 => Some(true), 0 => Some(false), _ => None, },
     }
 }
 
 fn find_first_string_for_key(value: &Value, target: &str) -> Option<String> {
     match value {
         Value::Object(map) => {
-            if let Some(v) = map.get(target)
-                && let Some(s) = v.as_str()
-            {
-                return Some(s.to_string());
-            }
-            for v in map.values() {
-                if let Some(found) = find_first_string_for_key(v, target) {
-                    return Some(found);
-                }
-            }
+            if let Some(v) = map.get(target) && let Some(s) = v.as_str() { return Some(s.to_string()); }
+            for v in map.values() { if let Some(found) = find_first_string_for_key(v, target) { return Some(found); } }
             None
         }
-        Value::Array(arr) => arr
-            .iter()
-            .find_map(|v| find_first_string_for_key(v, target)),
+        Value::Array(arr) => arr.iter().find_map(|v| find_first_string_for_key(v, target)),
         _ => None,
     }
 }
@@ -824,20 +553,10 @@ fn find_first_usize_for_key(value: &Value, target: &str) -> Option<usize> {
     match value {
         Value::Object(map) => {
             if let Some(v) = map.get(target) {
-                if let Some(n) = v.as_u64() {
-                    return Some(n as usize);
-                }
-                if let Some(s) = v.as_str()
-                    && let Ok(n) = s.parse::<usize>()
-                {
-                    return Some(n);
-                }
+                if let Some(n) = v.as_u64() { return Some(n as usize); }
+                if let Some(s) = v.as_str() && let Ok(n) = s.parse::<usize>() { return Some(n); }
             }
-            for v in map.values() {
-                if let Some(found) = find_first_usize_for_key(v, target) {
-                    return Some(found);
-                }
-            }
+            for v in map.values() { if let Some(found) = find_first_usize_for_key(v, target) { return Some(found); } }
             None
         }
         Value::Array(arr) => arr.iter().find_map(|v| find_first_usize_for_key(v, target)),
@@ -849,20 +568,10 @@ fn find_first_i64_for_key(value: &Value, target: &str) -> Option<i64> {
     match value {
         Value::Object(map) => {
             if let Some(v) = map.get(target) {
-                if let Some(n) = v.as_i64() {
-                    return Some(n);
-                }
-                if let Some(s) = v.as_str()
-                    && let Ok(n) = s.parse::<i64>()
-                {
-                    return Some(n);
-                }
+                if let Some(n) = v.as_i64() { return Some(n); }
+                if let Some(s) = v.as_str() && let Ok(n) = s.parse::<i64>() { return Some(n); }
             }
-            for v in map.values() {
-                if let Some(found) = find_first_i64_for_key(v, target) {
-                    return Some(found);
-                }
-            }
+            for v in map.values() { if let Some(found) = find_first_i64_for_key(v, target) { return Some(found); } }
             None
         }
         Value::Array(arr) => arr.iter().find_map(|v| find_first_i64_for_key(v, target)),
@@ -873,27 +582,14 @@ fn find_first_i64_for_key(value: &Value, target: &str) -> Option<i64> {
 fn find_first_string_array_for_key(value: &Value, target: &str) -> Option<Vec<String>> {
     match value {
         Value::Object(map) => {
-            if let Some(v) = map.get(target)
-                && let Some(arr) = v.as_array()
-            {
-                let out: Vec<String> = arr
-                    .iter()
-                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                    .collect();
-                if !out.is_empty() {
-                    return Some(out);
-                }
+            if let Some(v) = map.get(target) && let Some(arr) = v.as_array() {
+                let out: Vec<String> = arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+                if !out.is_empty() { return Some(out); }
             }
-            for v in map.values() {
-                if let Some(found) = find_first_string_array_for_key(v, target) {
-                    return Some(found);
-                }
-            }
+            for v in map.values() { if let Some(found) = find_first_string_array_for_key(v, target) { return Some(found); } }
             None
         }
-        Value::Array(arr) => arr
-            .iter()
-            .find_map(|v| find_first_string_array_for_key(v, target)),
+        Value::Array(arr) => arr.iter().find_map(|v| find_first_string_array_for_key(v, target)),
         _ => None,
     }
 }
@@ -903,29 +599,21 @@ fn regex_json_string_field(html: &str, field: &str) -> Option<String> {
     let re = regex::Regex::new(&pattern).ok()?;
     let caps = re.captures(html)?;
     let raw = caps.get(1)?.as_str();
-
-    // 尝试按 JSON 字符串规则反转义
     let quoted = format!("\"{}\"", raw);
-    serde_json::from_str::<String>(&quoted)
-        .ok()
-        .or_else(|| Some(raw.to_string()))
+    serde_json::from_str::<String>(&quoted).ok().or_else(|| Some(raw.to_string()))
 }
 
 fn regex_json_usize_field(html: &str, field: &str) -> Option<usize> {
     let pattern = format!(r#"\"{}\"\s*:\s*(\d+)"#, regex::escape(field));
     let re = regex::Regex::new(&pattern).ok()?;
-    let caps = re.captures(html)?;
     caps.get(1)?.as_str().parse::<usize>().ok()
 }
 
 fn parse_tags_from_info_label(html: &str) -> Option<Vec<String>> {
-    let re = re_info_label_grey();
     let mut out = Vec::new();
-    for caps in re.captures_iter(html) {
+    for caps in re_info_label_grey().captures_iter(html) {
         let raw = caps.get(1)?.as_str().trim();
-        if !raw.is_empty() {
-            out.push(raw.to_string());
-        }
+        if !raw.is_empty() { out.push(raw.to_string()); }
     }
     if out.is_empty() { None } else { Some(out) }
 }
@@ -933,68 +621,14 @@ fn parse_tags_from_info_label(html: &str) -> Option<Vec<String>> {
 fn parse_finished_from_info_label(html: &str) -> Option<bool> {
     let caps = re_info_label_yellow().captures(html)?;
     let label = caps.get(1)?.as_str().trim();
-    if label.contains("未完结") || label.contains("连载") {
-        return Some(false);
-    }
-    if label.contains("完结") {
-        return Some(true);
-    }
+    if label.contains("未完结") || label.contains("连载") { return Some(false); }
+    if label.contains("完结") { return Some(true); }
     None
 }
 
 fn jitter_seconds(max: f64) -> f64 {
-    if max <= 0.0 {
-        return 0.0;
-    }
-    // 用时间戳制造一个轻量抖动（避免引入 rand 依赖）
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64)
-        .unwrap_or(0);
-    let bucket = (nanos % 10_000) as f64 / 10_000.0; // [0,1)
+    if max <= 0.0 { return 0.0; }
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos() as u64).unwrap_or(0);
+    let bucket = (nanos % 10_000) as f64 / 10_000.0;
     bucket * max
-}
-
-fn _ensure_parent_dir(path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ContentParser;
-
-    #[test]
-    fn finished_should_prefer_html_label_over_numeric_status() {
-        let html = r#"
-        <span class="info-label-yellow">已完结</span>
-        <script>
-        window.__INITIAL_STATE__ = {"page":{"status":0}};
-        </script>
-        "#;
-
-        let info = ContentParser::parse_book_info(html, "dummy");
-        assert_eq!(info.finished, Some(true));
-    }
-
-    #[test]
-    fn finished_status_mapping_for_status_field() {
-        let html_finished = r#"
-        <script>
-        window.__INITIAL_STATE__ = {"page":{"status":1}};
-        </script>
-        "#;
-        let info_finished = ContentParser::parse_book_info(html_finished, "dummy");
-        assert_eq!(info_finished.finished, Some(true));
-
-        let html_serializing = r#"
-        <script>
-        window.__INITIAL_STATE__ = {"page":{"status":0}};
-        </script>
-        "#;
-        let info_serializing = ContentParser::parse_book_info(html_serializing, "dummy");
-        assert_eq!(info_serializing.finished, Some(false));
-    }
 }
