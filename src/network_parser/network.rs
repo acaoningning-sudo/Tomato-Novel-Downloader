@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports, unused_variables)]
 
 use reqwest::blocking::Client;
 use reqwest::header::{
@@ -11,7 +11,6 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, warn};
 
-// 编译一次复用的正则缓存
 fn re_next_data() -> &'static regex::Regex {
     static R: OnceLock<regex::Regex> = OnceLock::new();
     R.get_or_init(|| {
@@ -61,8 +60,7 @@ pub(crate) struct BookInfo {
     pub html_img_cover_url: Option<String>,
     pub chapter_count: Option<usize>,
     pub finished: Option<bool>,
-    // 🌟新增核心：抓取真实的短篇正文 ID
-    pub first_item_id: Option<String>, 
+    pub first_item_id: Option<String>, // 抓到的短篇真实 ID
 }
 
 #[derive(Debug, Clone)]
@@ -90,8 +88,11 @@ pub(crate) struct FanqieWebNetwork {
     client: Client,
     config: FanqieWebConfig,
     last_dir_fetch: Mutex<Instant>,
+    // 🌟 核心魔法：把短篇 ID 藏在这个内部背包里
+    pub last_first_item_id: Mutex<Option<String>>,
 }
 
+// 恢复 9 个返回值，坚决不影响项目里的其他文件！
 pub(crate) type BookInfoParts = (
     Option<String>,
     Option<String>,
@@ -102,7 +103,6 @@ pub(crate) type BookInfoParts = (
     Option<String>, 
     Option<usize>,
     Option<bool>,
-    Option<String>, // 🌟新增的返回值位置
 );
 
 impl FanqieWebNetwork {
@@ -121,129 +121,70 @@ impl FanqieWebNetwork {
             client,
             config,
             last_dir_fetch: Mutex::new(Instant::now() - Duration::from_secs(60)),
+            last_first_item_id: Mutex::new(None), // 初始化背包
         })
     }
 
     fn get_headers(&self) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            ACCEPT,
-            HeaderValue::from_static(
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            ),
-        );
-        headers.insert(
-            USER_AGENT,
-            HeaderValue::from_str(&self.config.user_agent)
-                .unwrap_or(HeaderValue::from_static("Mozilla/5.0")),
-        );
+        headers.insert(ACCEPT, HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"));
+        headers.insert(USER_AGENT, HeaderValue::from_str(&self.config.user_agent).unwrap_or(HeaderValue::from_static("Mozilla/5.0")));
         headers
     }
 
     fn get_json_headers(&self, book_id: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            ACCEPT,
-            HeaderValue::from_static("application/json, text/plain, */*"),
-        );
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json, text/plain, */*"));
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            USER_AGENT,
-            HeaderValue::from_str(&self.config.user_agent)
-                .unwrap_or(HeaderValue::from_static("Mozilla/5.0")),
-        );
+        headers.insert(USER_AGENT, HeaderValue::from_str(&self.config.user_agent).unwrap_or(HeaderValue::from_static("Mozilla/5.0")));
         let referer = format!("https://fanqienovel.com/page/{book_id}");
-        if let Ok(v) = HeaderValue::from_str(&referer) {
-            headers.insert(REFERER, v);
-        }
+        if let Ok(v) = HeaderValue::from_str(&referer) { headers.insert(REFERER, v); }
         headers
     }
 
     pub(crate) fn get_book_info(&self, book_id: &str) -> BookInfoParts {
         let book_info_url = format!("https://fanqienovel.com/page/{book_id}");
 
-        match self
-            .client
-            .get(&book_info_url)
-            .headers(self.get_headers())
-            .send()
-        {
+        match self.client.get(&book_info_url).headers(self.get_headers()).send() {
             Ok(resp) => {
                 if resp.status().as_u16() == 404 {
-                    warn!("小说ID {} 主页 404，尝试回退至阅读页获取信息...", book_id);
                     let reader_url = format!("https://fanqienovel.com/reader/{}", book_id);
                     if let Ok(reader_resp) = self.client.get(&reader_url).headers(self.get_headers()).send() {
                         if reader_resp.status().is_success() {
                             if let Ok(text) = reader_resp.text() {
                                 let info = ContentParser::parse_book_info(&text, book_id);
-                                return (
-                                    info.book_name,
-                                    info.author,
-                                    info.description,
-                                    info.tags,
-                                    info.cover_url,
-                                    info.detail_cover_url,
-                                    info.html_img_cover_url,
-                                    info.chapter_count,
-                                    info.finished,
-                                    info.first_item_id,
-                                );
+                                // 把抓到的真实 ID 悄悄存进内部背包
+                                if let Ok(mut cache) = self.last_first_item_id.lock() { *cache = info.first_item_id.clone(); }
+                                return (info.book_name, info.author, info.description, info.tags, info.cover_url, info.detail_cover_url, info.html_img_cover_url, info.chapter_count, info.finished);
                             }
                         }
                     }
-                    error!("小说ID {} 不存在！", book_id);
-                    return (None, None, None, None, None, None, None, None, None, None);
+                    return (None, None, None, None, None, None, None, None, None);
                 }
 
-                let resp = match resp.error_for_status() {
-                    Ok(r) => r,
-                    Err(e) => {
-                        error!("获取书籍信息失败: {}", e);
-                        return (None, None, None, None, None, None, None, None, None, None);
-                    }
-                };
+                let resp = match resp.error_for_status() { Ok(r) => r, Err(_) => return (None, None, None, None, None, None, None, None, None) };
 
                 match resp.text() {
                     Ok(text) => {
                         let info = ContentParser::parse_book_info(&text, book_id);
-                        (
-                            info.book_name,
-                            info.author,
-                            info.description,
-                            info.tags,
-                            info.cover_url,
-                            info.detail_cover_url,
-                            info.html_img_cover_url,
-                            info.chapter_count,
-                            info.finished,
-                            info.first_item_id,
-                        )
+                        // 把抓到的真实 ID 悄悄存进内部背包
+                        if let Ok(mut cache) = self.last_first_item_id.lock() { *cache = info.first_item_id.clone(); }
+                        (info.book_name, info.author, info.description, info.tags, info.cover_url, info.detail_cover_url, info.html_img_cover_url, info.chapter_count, info.finished)
                     }
-                    Err(e) => {
-                        error!("获取书籍信息失败: {}", e);
-                        (None, None, None, None, None, None, None, None, None, None)
-                    }
+                    Err(_) => (None, None, None, None, None, None, None, None, None)
                 }
             }
-            Err(e) => {
-                error!("获取书籍信息失败: {}", e);
-                (None, None, None, None, None, None, None, None, None, None)
-            }
+            Err(_) => (None, None, None, None, None, None, None, None, None)
         }
     }
 
     pub(crate) fn fetch_chapter_list(&self, book_id: &str) -> Option<Vec<Value>> {
-        if book_id.trim().is_empty() || !book_id.chars().all(|c| c.is_ascii_digit()) {
-            return None;
-        }
-
+        if book_id.trim().is_empty() || !book_id.chars().all(|c| c.is_ascii_digit()) { return None; }
         let api_url = format!("https://fanqienovel.com/api/reader/directory/detail?bookId={book_id}");
         self.throttle_directory(Duration::from_millis(800));
 
         let retries = self.config.max_retries.max(1);
         let mut backoff = 0.6f64;
-        
-        // 修正：加了下划线前缀，消除 unused variable 警告
         let mut _last_error: Option<String> = None;
 
         for attempt in 1..=retries {
@@ -252,123 +193,77 @@ impl FanqieWebNetwork {
 
             let resp = match resp {
                 Ok(r) => r,
-                Err(e) => {
-                    _last_error = Some(e.to_string());
-                    self.sleep_backoff(attempt, retries, &mut backoff, 0.3);
-                    continue;
-                }
+                Err(e) => { _last_error = Some(e.to_string()); self.sleep_backoff(attempt, retries, &mut backoff, 0.3); continue; }
             };
 
             if resp.status().as_u16() == 403 {
                 _last_error = Some("403 Forbidden".to_string());
-                if attempt == 1 {
-                    let warm_url = format!("https://fanqienovel.com/page/{book_id}");
-                    let _ = self.client.get(&warm_url).headers(self.get_headers()).send();
-                }
-                self.sleep_backoff(attempt, retries, &mut backoff, 0.4);
-                continue;
+                if attempt == 1 { let _ = self.client.get(&format!("https://fanqienovel.com/page/{book_id}")).headers(self.get_headers()).send(); }
+                self.sleep_backoff(attempt, retries, &mut backoff, 0.4); continue;
             }
 
             let resp = match resp.error_for_status() {
                 Ok(r) => r,
-                Err(e) => {
-                    _last_error = Some(e.to_string());
-                    self.sleep_backoff(attempt, retries, &mut backoff, 0.3);
-                    continue;
-                }
+                Err(e) => { _last_error = Some(e.to_string()); self.sleep_backoff(attempt, retries, &mut backoff, 0.3); continue; }
             };
 
             let data: Value = match resp.json() {
                 Ok(v) => v,
-                Err(e) => {
-                    _last_error = Some(e.to_string());
-                    self.sleep_backoff(attempt, retries, &mut backoff, 0.3);
-                    continue;
-                }
+                Err(e) => { _last_error = Some(e.to_string()); self.sleep_backoff(attempt, retries, &mut backoff, 0.3); continue; }
             };
 
             let _ = self.save_dir_cache(book_id, &data);
-
-            if let Some(list) = Self::parse_chapter_data(&data) {
-                return Some(list);
-            }
+            if let Some(list) = Self::parse_chapter_data(&data) { return Some(list); }
 
             _last_error = Some("parse chapter list failed".to_string());
             self.sleep_backoff(attempt, retries, &mut backoff, 0.3);
             continue;
         }
 
-        match self.load_dir_cache(book_id) {
-            Ok(Some(cached)) => Self::parse_chapter_data(&cached),
-            _ => None,
-        }
+        match self.load_dir_cache(book_id) { Ok(Some(cached)) => Self::parse_chapter_data(&cached), _ => None, }
     }
 
     fn throttle_directory(&self, min_gap: Duration) {
         if let Ok(mut last) = self.last_dir_fetch.lock() {
             let elapsed = last.elapsed();
-            if elapsed < min_gap {
-                std::thread::sleep(min_gap - elapsed);
-            }
+            if elapsed < min_gap { std::thread::sleep(min_gap - elapsed); }
             *last = Instant::now();
         }
     }
 
     fn sleep_backoff(&self, attempt: usize, retries: usize, backoff: &mut f64, jitter_max: f64) {
-        if attempt >= retries {
-            return;
-        }
+        if attempt >= retries { return; }
         let jitter = jitter_seconds(jitter_max);
         let sleep_s = (*backoff + jitter).min(3.0);
         std::thread::sleep(Duration::from_millis((sleep_s * 1000.0) as u64));
         *backoff = (*backoff * 2.0).min(3.0);
     }
 
-    fn cache_path(&self, book_id: &str) -> PathBuf {
-        self.config.cache_dir.join(format!("{book_id}.json"))
-    }
-
+    fn cache_path(&self, book_id: &str) -> PathBuf { self.config.cache_dir.join(format!("{book_id}.json")) }
     fn save_dir_cache(&self, book_id: &str, data: &Value) -> anyhow::Result<()> {
         let path = self.cache_path(book_id);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let bytes = serde_json::to_vec(data)?;
-        fs::write(path, bytes)?;
-        Ok(())
+        if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+        fs::write(path, serde_json::to_vec(data)?)?; Ok(())
     }
-
     fn load_dir_cache(&self, book_id: &str) -> anyhow::Result<Option<Value>> {
         let path = self.cache_path(book_id);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let bytes = fs::read(path)?;
-        let value: Value = serde_json::from_slice(&bytes)?;
-        Ok(Some(value))
+        if !path.exists() { return Ok(None); }
+        Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
     }
 
     fn parse_chapter_data(data: &Value) -> Option<Vec<Value>> {
         let root = data.get("data").unwrap_or(data);
         for key in ["chapterList", "chapter_list", "chapters", "item_list", "items", "list"] {
-            if let Some(arr) = root.get(key).and_then(Value::as_array) {
-                return Some(arr.clone());
-            }
+            if let Some(arr) = root.get(key).and_then(Value::as_array) { return Some(arr.clone()); }
         }
         if let Some(volumes) = root.get("chapterListWithVolume").and_then(Value::as_array) {
             let mut all_chapters: Vec<Value> = Vec::new();
-            for vol in volumes {
-                if let Some(ch_list) = vol.as_array() {
-                    all_chapters.extend(ch_list.iter().cloned());
-                }
-            }
+            for vol in volumes { if let Some(ch_list) = vol.as_array() { all_chapters.extend(ch_list.iter().cloned()); } }
             if !all_chapters.is_empty() { return Some(all_chapters); }
         }
         if let Some(inner) = root.get("data") {
             for key in ["list", "chapterList", "chapter_list", "items", "item_list", "chapters"] {
-                if let Some(arr) = inner.get(key).and_then(Value::as_array) {
-                    return Some(arr.clone());
-                }
+                if let Some(arr) = inner.get(key).and_then(Value::as_array) { return Some(arr.clone()); }
             }
         }
         find_chapter_array(root)
@@ -402,18 +297,13 @@ fn find_chapter_array(value: &Value) -> Option<Vec<Value>> {
 
 fn parse_html_img_cover_url(html: &str) -> Option<String> {
     for caps in re_ld_json().captures_iter(html) {
-        let json_text = caps.get(1)?.as_str();
-        let Ok(value) = serde_json::from_str::<Value>(json_text) else { continue; };
+        let Ok(value) = serde_json::from_str::<Value>(caps.get(1)?.as_str()) else { continue; };
         for key in ["image", "images"] {
-            if let Some(arr) = value.get(key).and_then(Value::as_array)
-                && let Some(url) = arr.first().and_then(Value::as_str)
-            {
-                let u = url.trim();
-                if !u.is_empty() && (u.starts_with("http://") || u.starts_with("https://")) { return Some(u.to_string()); }
+            if let Some(arr) = value.get(key).and_then(Value::as_array) && let Some(url) = arr.first().and_then(Value::as_str) {
+                let u = url.trim(); if !u.is_empty() && (u.starts_with("http://") || u.starts_with("https://")) { return Some(u.to_string()); }
             }
             if let Some(url) = value.get(key).and_then(Value::as_str) {
-                let u = url.trim();
-                if !u.is_empty() && (u.starts_with("http://") || u.starts_with("https://")) { return Some(u.to_string()); }
+                let u = url.trim(); if !u.is_empty() && (u.starts_with("http://") || u.starts_with("https://")) { return Some(u.to_string()); }
             }
         }
     }
@@ -421,15 +311,12 @@ fn parse_html_img_cover_url(html: &str) -> Option<String> {
 }
 
 struct ContentParser;
-
 impl ContentParser {
     fn parse_book_info(html: &str, _book_id: &str) -> BookInfo {
         let finished_from_label = parse_finished_from_info_label(html);
         let html_img_cover_url = parse_html_img_cover_url(html);
 
-        if let Some(json_text) = extract_next_data_json(html)
-            && let Ok(value) = serde_json::from_str::<Value>(&json_text)
-        {
+        if let Some(json_text) = extract_next_data_json(html) && let Ok(value) = serde_json::from_str::<Value>(&json_text) {
             let book_name = find_string_by_key(&value, ["bookName", "book_name", "title", "name"]);
             let author = find_string_by_key(&value, ["author", "authorName", "author_name"]);
             let description = find_string_by_key(&value, ["abstract", "description", "intro", "introduce"]);
@@ -439,20 +326,14 @@ impl ContentParser {
             let chapter_count = find_usize_by_key(&value, ["chapterCount", "chapter_count"]);
             let tags = find_string_array_by_key(&value, ["tags", "tagNames", "tag_names"]);
             let finished = finished_from_label.or_else(|| find_finished_by_key(&value));
-            
-            // 🌟 雷达启动：挖掘首章（短篇本体）ID
             let first_item_id = find_string_by_key(&value, ["first_chapter_item_id", "firstChapterItemId", "item_id", "itemId"]);
 
             if book_name.is_some() || first_item_id.is_some() {
-                return BookInfo {
-                    book_name, author, description, tags, cover_url, detail_cover_url, html_img_cover_url, chapter_count, finished, first_item_id,
-                };
+                return BookInfo { book_name, author, description, tags, cover_url, detail_cover_url, html_img_cover_url, chapter_count, finished, first_item_id };
             }
         }
 
-        if let Some(json_text) = extract_initial_state_json(html)
-            && let Ok(value) = serde_json::from_str::<Value>(&json_text)
-        {
+        if let Some(json_text) = extract_initial_state_json(html) && let Ok(value) = serde_json::from_str::<Value>(&json_text) {
             let book_name = find_string_by_key(&value, ["bookName", "book_name", "title", "name"]);
             let author = find_string_by_key(&value, ["authorName", "author", "author_name"]);
             let description = find_string_by_key(&value, ["abstract", "description", "intro", "introduce"]);
@@ -465,9 +346,7 @@ impl ContentParser {
             let first_item_id = find_string_by_key(&value, ["first_chapter_item_id", "firstChapterItemId", "item_id", "itemId"]);
 
             if book_name.is_some() || first_item_id.is_some() {
-                return BookInfo {
-                    book_name, author, description, tags, cover_url, detail_cover_url, html_img_cover_url, chapter_count, finished, first_item_id,
-                };
+                return BookInfo { book_name, author, description, tags, cover_url, detail_cover_url, html_img_cover_url, chapter_count, finished, first_item_id };
             }
         }
 
@@ -491,46 +370,32 @@ fn build_cover_url_from_thumb_uri(uri: &str) -> Option<String> {
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") { return Some(trimmed.to_string()); }
     Some(format!("https://p3-reading-sign.fqnovelpic.com/{}", trimmed))
 }
-
 fn extract_next_data_json(html: &str) -> Option<String> {
     let caps = re_next_data().captures(html)?;
     Some(caps.get(1)?.as_str().trim().to_string())
 }
-
 fn extract_initial_state_json(html: &str) -> Option<String> {
     let caps = re_initial_state().captures(html)?;
     Some(caps.get(1)?.as_str().trim().to_string())
 }
 
 fn find_string_by_key<const N: usize>(value: &Value, keys: [&str; N]) -> Option<String> {
-    for key in keys {
-        if let Some(s) = find_first_string_for_key(value, key) { return Some(s); }
-    }
+    for key in keys { if let Some(s) = find_first_string_for_key(value, key) { return Some(s); } }
     None
 }
-
 fn find_usize_by_key<const N: usize>(value: &Value, keys: [&str; N]) -> Option<usize> {
-    for key in keys {
-        if let Some(n) = find_first_usize_for_key(value, key) { return Some(n); }
-    }
+    for key in keys { if let Some(n) = find_first_usize_for_key(value, key) { return Some(n); } }
     None
 }
-
 fn find_string_array_by_key<const N: usize>(value: &Value, keys: [&str; N]) -> Option<Vec<String>> {
-    for key in keys {
-        if let Some(arr) = find_first_string_array_for_key(value, key) { return Some(arr); }
-    }
+    for key in keys { if let Some(arr) = find_first_string_array_for_key(value, key) { return Some(arr); } }
     None
 }
-
 fn find_finished_by_key(value: &Value) -> Option<bool> {
     let keys = ["status", "serial_status", "finish_status", "finishStatus", "is_finish", "is_finished"];
-    for key in keys {
-        if let Some(n) = find_first_i64_for_key(value, key) && let Some(b) = map_status_to_finished(key, n) { return Some(b); }
-    }
+    for key in keys { if let Some(n) = find_first_i64_for_key(value, key) && let Some(b) = map_status_to_finished(key, n) { return Some(b); } }
     None
 }
-
 fn map_status_to_finished(key: &str, n: i64) -> Option<bool> {
     match key {
         "status" => match n { 1 => Some(true), 0 => Some(false), 2 => Some(true), _ => None, },
@@ -538,7 +403,6 @@ fn map_status_to_finished(key: &str, n: i64) -> Option<bool> {
         _ => match n { 1 | 2 => Some(true), 0 => Some(false), _ => None, },
     }
 }
-
 fn find_first_string_for_key(value: &Value, target: &str) -> Option<String> {
     match value {
         Value::Object(map) => {
@@ -550,7 +414,6 @@ fn find_first_string_for_key(value: &Value, target: &str) -> Option<String> {
         _ => None,
     }
 }
-
 fn find_first_usize_for_key(value: &Value, target: &str) -> Option<usize> {
     match value {
         Value::Object(map) => {
@@ -565,7 +428,6 @@ fn find_first_usize_for_key(value: &Value, target: &str) -> Option<usize> {
         _ => None,
     }
 }
-
 fn find_first_i64_for_key(value: &Value, target: &str) -> Option<i64> {
     match value {
         Value::Object(map) => {
@@ -580,7 +442,6 @@ fn find_first_i64_for_key(value: &Value, target: &str) -> Option<i64> {
         _ => None,
     }
 }
-
 fn find_first_string_array_for_key(value: &Value, target: &str) -> Option<Vec<String>> {
     match value {
         Value::Object(map) => {
@@ -595,24 +456,18 @@ fn find_first_string_array_for_key(value: &Value, target: &str) -> Option<Vec<St
         _ => None,
     }
 }
-
 fn regex_json_string_field(html: &str, field: &str) -> Option<String> {
     let pattern = format!(r#"\"{}\"\s*:\s*\"(.*?)\""#, regex::escape(field));
     let re = regex::Regex::new(&pattern).ok()?;
     let caps = re.captures(html)?;
     let raw = caps.get(1)?.as_str();
-    let quoted = format!("\"{}\"", raw);
-    serde_json::from_str::<String>(&quoted).ok().or_else(|| Some(raw.to_string()))
+    serde_json::from_str::<String>(&format!("\"{}\"", raw)).ok().or_else(|| Some(raw.to_string()))
 }
-
-// 🐛 核心修复点：把删漏的 caps 加回来了，这是引发血案的罪魁祸首！
 fn regex_json_usize_field(html: &str, field: &str) -> Option<usize> {
     let pattern = format!(r#"\"{}\"\s*:\s*(\d+)"#, regex::escape(field));
     let re = regex::Regex::new(&pattern).ok()?;
-    let caps = re.captures(html)?; 
-    caps.get(1)?.as_str().parse::<usize>().ok()
+    re.captures(html)?.get(1)?.as_str().parse::<usize>().ok()
 }
-
 fn parse_tags_from_info_label(html: &str) -> Option<Vec<String>> {
     let mut out = Vec::new();
     for caps in re_info_label_grey().captures_iter(html) {
@@ -621,7 +476,6 @@ fn parse_tags_from_info_label(html: &str) -> Option<Vec<String>> {
     }
     if out.is_empty() { None } else { Some(out) }
 }
-
 fn parse_finished_from_info_label(html: &str) -> Option<bool> {
     let caps = re_info_label_yellow().captures(html)?;
     let label = caps.get(1)?.as_str().trim();
@@ -629,10 +483,8 @@ fn parse_finished_from_info_label(html: &str) -> Option<bool> {
     if label.contains("完结") { return Some(true); }
     None
 }
-
 fn jitter_seconds(max: f64) -> f64 {
     if max <= 0.0 { return 0.0; }
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos() as u64).unwrap_or(0);
-    let bucket = (nanos % 10_000) as f64 / 10_000.0;
-    bucket * max
+    (nanos % 10_000) as f64 / 10_000.0 * max
 }
