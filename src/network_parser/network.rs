@@ -170,10 +170,32 @@ impl FanqieWebNetwork {
             .send()
         {
             Ok(resp) => {
+                // 核心修改点：主页 404 时，回退获取短篇小说阅读页
                 if resp.status().as_u16() == 404 {
-                    error!("小说ID {} 不存在！", book_id);
+                    warn!("小说ID {} 主页 404，猜测其可能是短篇小说(itemId)。尝试回退至阅读页获取信息...", book_id);
+                    let reader_url = format!("https://fanqienovel.com/reader/{}", book_id);
+                    if let Ok(reader_resp) = self.client.get(&reader_url).headers(self.get_headers()).send() {
+                        if reader_resp.status().is_success() {
+                            if let Ok(text) = reader_resp.text() {
+                                let info = ContentParser::parse_book_info(&text, book_id);
+                                return (
+                                    info.book_name,
+                                    info.author,
+                                    info.description,
+                                    info.tags,
+                                    info.cover_url,
+                                    info.detail_cover_url,
+                                    info.html_img_cover_url,
+                                    info.chapter_count,
+                                    info.finished,
+                                );
+                            }
+                        }
+                    }
+                    error!("小说ID {} 不存在！(主页和阅读页均无数据返回)", book_id);
                     return (None, None, None, None, None, None, None, None, None);
                 }
+
                 let resp = match resp.error_for_status() {
                     Ok(r) => r,
                     Err(e) => {
