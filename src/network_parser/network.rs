@@ -242,7 +242,9 @@ impl FanqieWebNetwork {
 
         let retries = self.config.max_retries.max(1);
         let mut backoff = 0.6f64;
-        let mut last_error: Option<String> = None;
+        
+        // 修正：加了下划线前缀，消除 unused variable 警告
+        let mut _last_error: Option<String> = None;
 
         for attempt in 1..=retries {
             let headers = self.get_json_headers(book_id);
@@ -251,14 +253,14 @@ impl FanqieWebNetwork {
             let resp = match resp {
                 Ok(r) => r,
                 Err(e) => {
-                    last_error = Some(e.to_string());
+                    _last_error = Some(e.to_string());
                     self.sleep_backoff(attempt, retries, &mut backoff, 0.3);
                     continue;
                 }
             };
 
             if resp.status().as_u16() == 403 {
-                last_error = Some("403 Forbidden".to_string());
+                _last_error = Some("403 Forbidden".to_string());
                 if attempt == 1 {
                     let warm_url = format!("https://fanqienovel.com/page/{book_id}");
                     let _ = self.client.get(&warm_url).headers(self.get_headers()).send();
@@ -270,7 +272,7 @@ impl FanqieWebNetwork {
             let resp = match resp.error_for_status() {
                 Ok(r) => r,
                 Err(e) => {
-                    last_error = Some(e.to_string());
+                    _last_error = Some(e.to_string());
                     self.sleep_backoff(attempt, retries, &mut backoff, 0.3);
                     continue;
                 }
@@ -279,7 +281,7 @@ impl FanqieWebNetwork {
             let data: Value = match resp.json() {
                 Ok(v) => v,
                 Err(e) => {
-                    last_error = Some(e.to_string());
+                    _last_error = Some(e.to_string());
                     self.sleep_backoff(attempt, retries, &mut backoff, 0.3);
                     continue;
                 }
@@ -291,7 +293,7 @@ impl FanqieWebNetwork {
                 return Some(list);
             }
 
-            last_error = Some("parse chapter list failed".to_string());
+            _last_error = Some("parse chapter list failed".to_string());
             self.sleep_backoff(attempt, retries, &mut backoff, 0.3);
             continue;
         }
@@ -603,9 +605,11 @@ fn regex_json_string_field(html: &str, field: &str) -> Option<String> {
     serde_json::from_str::<String>(&quoted).ok().or_else(|| Some(raw.to_string()))
 }
 
+// 🐛 核心修复点：把删漏的 caps 加回来了，这是引发血案的罪魁祸首！
 fn regex_json_usize_field(html: &str, field: &str) -> Option<usize> {
     let pattern = format!(r#"\"{}\"\s*:\s*(\d+)"#, regex::escape(field));
     let re = regex::Regex::new(&pattern).ok()?;
+    let caps = re.captures(html)?; 
     caps.get(1)?.as_str().parse::<usize>().ok()
 }
 
